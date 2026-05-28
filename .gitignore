@@ -1,0 +1,79 @@
+# =============================================================================
+# DSFP — .gitignore
+# =============================================================================
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# ── Distribution / packaging ──────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+
+# ── PyTorch checkpoints & model weights ──────────────────────────────────────
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+data/
+# If you want to track config/metadata but not raw data, use:
+# !data/.gitkeep
+
+# ── Results & experiment outputs ─────────────────────────────────────────────
+results/
+# Uncomment below to commit summary CSVs but not full logs/checkpoints:
+# !results/**/summary.csv
+# !results/**/results.json
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Jupyter notebooks (optional — comment out if you use notebooks) ───────────
+*.ipynb
+.ipynb_checkpoints/
+
+# ── IDE and editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── pytest / coverage ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── MyPy / type checkers ──────────────────────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ── Weights & Biases ─────────────────────────────────────────────────────────
+wandb/
+
+# ── SLURM / HPC job output ───────────────────────────────────────────────────
+slurm-*.out
+slurm-*.err
+*.sbatch.log

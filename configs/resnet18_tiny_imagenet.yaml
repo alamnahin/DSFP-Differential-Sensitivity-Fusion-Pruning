@@ -1,0 +1,49 @@
+# configs/resnet18_tiny_imagenet.yaml
+# DSFP experiment: ResNet-18 on Tiny-ImageNet (64x64, 200 classes).
+# Download data first: http://cs231n.stanford.edu/tiny-imagenet-200.zip
+# Extract to ./data/ so the path ./data/tiny-imagenet-200/train exists.
+# Run: python main.py --config configs/resnet18_tiny_imagenet.yaml
+
+arch: resnet18
+dataset: tiny-imagenet
+num-classes: 200
+data-dir: ./data
+
+batch-size: 128
+num-workers: 4
+calibration-size: 512
+
+base-epochs: 60
+base-lr: 0.001
+weight-decay: 0.0001
+momentum: 0.9
+label-smoothing: 0.1
+cosine-t0: 50
+cosine-tmult: 2
+accumulation-steps: 4
+patience: 15
+
+pruning-rates: [50, 70]
+method: dsfp
+
+bandit-lr: 0.01
+bandit-buffer-size: 512
+bandit-hidden: 32
+bandit-epsilon-decay: 0.995
+bandit-explore-delta: 5.0
+
+kd-epochs: 700
+kd-lr: 0.0001
+kd-weight-decay: 0.0001
+kd-alpha: 0.5
+kd-temperature: 4.0
+kd-patience: 10
+kd-dynamic-alpha: true
+
+seeds: [42, 123, 2026]
+
+output-dir: ./results
+save-checkpoints: true
+amp: true
+ablation: false
+baselines: true

@@ -1,0 +1,21 @@
+# DSFP: Differential Sensitivity Fusion Pruning
+# Python >= 3.9 required
+# Install: pip install -r requirements.txt
+
+# ── Core deep learning ────────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── FLOPs counting (required for correct MFLOPs reporting) ───────────────────
+thop>=0.1.1
+
+# ── Numerics & data ───────────────────────────────────────────────────────────
+numpy>=1.24.0
+pyyaml>=6.0
+
+# ── Optional: experiment tracking ────────────────────────────────────────────
+# Uncomment to enable W&B logging (add --wandb flag to main.py if desired)
+# wandb>=0.16.0
+
+# ── Dev / testing ─────────────────────────────────────────────────────────────
+pytest>=7.4.0
