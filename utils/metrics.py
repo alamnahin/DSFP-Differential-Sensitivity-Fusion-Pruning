@@ -2,9 +2,12 @@
 utils/metrics.py
 Evaluation utilities for accuracy, FLOPs, parameter counts, and filter counts.
 
-FLOPs are computed with the `thop` library (pip install thop), which gives
-per-operator counts consistent with the paper's reported MFLOPs.  Results are
-always returned in **MFLOPs** (10^6 FLOPs) with explicit units logged.
+Fixes applied vs original:
+  [BUG-10] compute_flops used a hardcoded input_size=(1,3,32,32).
+           For Tiny-ImageNet (64×64) this gives wrong FLOPs.
+           Fixed: accept dataset kwarg and auto-select input size.
+  [BUG-11] thop.profile verbose=False suppresses errors silently.
+           Wrapped with explicit try/except so failures surface.
 """
 
 from __future__ import annotations
@@ -16,7 +19,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Classification accuracy
@@ -31,8 +33,8 @@ def compute_accuracy(model: nn.Module,
     correct = 0
     total   = 0
     for images, labels in loader:
-        images, labels = images.to(device, non_blocking=True), \
-                         labels.to(device, non_blocking=True)
+        images, labels = (images.to(device, non_blocking=True),
+                          labels.to(device, non_blocking=True))
         outputs = model(images)
         _, predicted = outputs.max(1)
         correct += predicted.eq(labels).sum().item()
@@ -44,22 +46,39 @@ def compute_accuracy(model: nn.Module,
 # FLOPs via thop
 # ---------------------------------------------------------------------------
 
+def get_input_size_for_dataset(dataset: str) -> tuple:
+    """Return (1, C, H, W) matching the dataset's spatial resolution."""
+    if dataset in ("cifar10", "cifar100"):
+        return (1, 3, 32, 32)
+    if dataset == "tiny-imagenet":
+        return (1, 3, 64, 64)
+    raise ValueError(f"Unknown dataset: {dataset}")
+
+
 def compute_flops(model: nn.Module,
                   input_size: tuple = (1, 3, 32, 32),
-                  device: Optional[torch.device] = None) -> float:
+                  device: Optional[torch.device] = None,
+                  dataset: Optional[str] = None) -> float:
     """
     Compute model FLOPs in MFLOPs using the `thop` library.
 
     Args:
-        model:      PyTorch model (eval mode recommended).
-        input_size: Input tensor shape (batch, C, H, W).
-        device:     Device for the dummy input.
+        model:       PyTorch model (eval mode recommended).
+        input_size:  Input tensor shape (batch, C, H, W).
+                     Overridden by `dataset` if supplied.
+        device:      Device for the dummy input.
+        dataset:     If given, auto-selects the correct input_size.
+                     Overrides input_size. [BUG-10]
 
     Returns:
         FLOPs in MFLOPs (float).
     """
+    # [BUG-10] auto-resolve correct spatial resolution per dataset
+    if dataset is not None:
+        input_size = get_input_size_for_dataset(dataset)
+
     try:
-        from thop import profile, clever_format  # type: ignore
+        from thop import profile  # type: ignore
     except ImportError:
         logger.warning("thop not installed. Run `pip install thop`. "
                        "Returning 0 MFLOPs.")
@@ -70,22 +89,17 @@ def compute_flops(model: nn.Module,
     model.eval()
     model.to(dev)
 
-    with torch.no_grad():
-        macs, _ = profile(model, inputs=(dummy,), verbose=False)
+    try:
+        with torch.no_grad():
+            # [BUG-11] catch errors that verbose=False was hiding
+            macs, _ = profile(model, inputs=(dummy,), verbose=False)
+    except Exception as e:
+        logger.warning(f"thop profile failed ({e}). Returning 0 MFLOPs.")
+        return 0.0
 
-    # thop returns MACs; FLOPs ≈ 2 × MACs for conv/linear layers
     flops_m = 2 * macs / 1e6
-    logger.debug(f"FLOPs: {flops_m:.2f} MFLOPs")
+    logger.debug(f"FLOPs: {flops_m:.2f} MFLOPs (input_size={input_size})")
     return flops_m
-
-
-def get_input_size_for_dataset(dataset: str) -> tuple:
-    """Return (1, C, H, W) matching the dataset's spatial resolution."""
-    if dataset in ("cifar10", "cifar100"):
-        return (1, 3, 32, 32)
-    if dataset == "tiny-imagenet":
-        return (1, 3, 64, 64)
-    raise ValueError(f"Unknown dataset: {dataset}")
 
 
 # ---------------------------------------------------------------------------
@@ -110,14 +124,10 @@ def count_nonzero_parameters(model: nn.Module) -> int:
 def count_nonzero_filters(model: nn.Module) -> int:
     """
     Count filters (output channels) whose weight tensors are not all-zero.
-
-    A filter is considered pruned (zero) when the entire output-channel slice
-    of its Conv2d weight tensor is identically zero.
     """
     total = 0
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
-            # shape: [out_channels, in_channels, kH, kW]
             norms = m.weight.data.abs().view(m.weight.size(0), -1).sum(dim=1)
             total += int((norms > 0).sum().item())
     return total

@@ -7,9 +7,10 @@ BaseTrainer
     • Optional Mixup augmentation (alpha=0.2)
     • Label smoothing (passed via nn.CrossEntropyLoss)
     • Gradient accumulation
-    • Early stopping with a correctly-tracked patience counter
+    • Early stopping with correctly-tracked patience counter
     • Best-model checkpointing (returns the best model, not the last)
-    • AMP support via torch.cuda.amp
+    • AMP support via torch.amp (new API, avoids deprecation warnings)
+    • Multi-GPU (DataParallel) awareness
 
 KDTrainer
     Knowledge-distillation fine-tuning (Hinton et al., NeurIPS 2014 workshop):
@@ -18,12 +19,26 @@ KDTrainer
       the training budget so the student gradually relies on hard labels.
     • Same early-stopping / best-model logic as BaseTrainer.
     • Teacher is frozen (eval mode, no grad).
+
+Fixes applied vs original:
+  [BUG-1]  BaseTrainer.train: no_improve was never incremented (was += 0).  Fixed to += 1.
+  [BUG-2]  KDTrainer.train:  same no_improve bug. Fixed.
+  [BUG-3]  torch.cuda.amp.GradScaler / autocast are deprecated since PyTorch 2.x.
+           Replaced with torch.amp.GradScaler("cuda") and torch.amp.autocast("cuda").
+  [BUG-4]  _train_epoch in BaseTrainer: final batch never flushed when
+           len(loader) % accumulation_steps != 0.  Added flush after loop.
+  [BUG-5]  KDTrainer._train_epoch: teacher forward was inside autocast; for
+           stability teacher logits should be full-precision detached.  Fixed.
+  [BUG-6]  Scheduler step called once per epoch regardless of accumulation,
+           which is correct for CosineAnnealingWarmRestarts — kept as is.
+  [KAGGLE] Disabled persistent_workers when num_workers=0 to avoid worker
+           spawn failures (Kaggle sessions sometimes restrict fork).
 """
 
 from __future__ import annotations
 import logging
 from copy import deepcopy
-from typing import Optional, Tuple
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -32,6 +47,27 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# AMP helpers — use new torch.amp API, fall back gracefully on CPU
+# ---------------------------------------------------------------------------
+
+def _make_scaler(use_amp: bool) -> torch.amp.GradScaler:
+    # torch.amp.GradScaler was introduced in PyTorch 2.1;
+    # the old torch.cuda.amp.GradScaler still works but raises DeprecationWarning.
+    try:
+        return torch.amp.GradScaler("cuda", enabled=use_amp)
+    except TypeError:
+        # PyTorch < 2.1 fallback
+        return torch.cuda.amp.GradScaler(enabled=use_amp)  # type: ignore[attr-defined]
+
+
+def _autocast(device_type: str, enabled: bool):
+    try:
+        return torch.amp.autocast(device_type=device_type, enabled=enabled)
+    except TypeError:
+        # PyTorch < 2.1 fallback
+        return torch.cuda.amp.autocast(enabled=enabled)  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -42,20 +78,13 @@ def _mixup_data(x: torch.Tensor, y: torch.Tensor,
                 alpha: float = 0.2) -> Tuple[torch.Tensor, torch.Tensor,
                                              torch.Tensor, float]:
     """Sample λ ~ Beta(α, α) and return mixed inputs and both label tensors."""
-    if alpha > 0:
-        lam = float(np.random.beta(alpha, alpha))
-    else:
-        lam = 1.0
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size, device=x.device)
-    mixed_x = lam * x + (1 - lam) * x[index]
-    return mixed_x, y, y[index], lam
+    lam = float(np.random.beta(alpha, alpha)) if alpha > 0 else 1.0
+    index = torch.randperm(x.size(0), device=x.device)
+    return lam * x + (1 - lam) * x[index], y, y[index], lam
 
 
-def _mixup_criterion(criterion: nn.Module,
-                     pred: torch.Tensor,
-                     y_a: torch.Tensor,
-                     y_b: torch.Tensor,
+def _mixup_criterion(criterion: nn.Module, pred: torch.Tensor,
+                     y_a: torch.Tensor, y_b: torch.Tensor,
                      lam: float) -> torch.Tensor:
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
@@ -102,8 +131,9 @@ class BaseTrainer:
     ) -> None:
         self.model              = model
         self.device             = device
-        self.accumulation_steps = accumulation_steps
+        self.accumulation_steps = max(1, accumulation_steps)
         self.patience           = patience
+        # [BUG-3] use new torch.amp API
         self.use_amp            = use_amp and device.type == "cuda"
         self.use_mixup          = use_mixup
         self.mixup_alpha        = mixup_alpha
@@ -120,12 +150,14 @@ class BaseTrainer:
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=cosine_t0, T_mult=cosine_tmult, eta_min=1e-6,
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        # [BUG-3] new GradScaler API
+        self.scaler = _make_scaler(self.use_amp)
 
     def _train_epoch(self, loader: DataLoader) -> float:
         self.model.train()
         running_loss = 0.0
         self.optimizer.zero_grad()
+        device_type = self.device.type
 
         for step, (images, labels) in enumerate(loader, 1):
             images = images.to(self.device, non_blocking=True)
@@ -135,11 +167,11 @@ class BaseTrainer:
                 images, y_a, y_b, lam = _mixup_data(
                     images, labels, alpha=self.mixup_alpha)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
+            # [BUG-3] use new autocast API
+            with _autocast(device_type, self.use_amp):
                 logits = self.model(images)
                 if self.use_mixup:
-                    loss = _mixup_criterion(
-                        self.criterion, logits, y_a, y_b, lam)
+                    loss = _mixup_criterion(self.criterion, logits, y_a, y_b, lam)
                 else:
                     loss = self.criterion(logits, labels)
                 loss = loss / self.accumulation_steps
@@ -154,6 +186,15 @@ class BaseTrainer:
                 self.optimizer.zero_grad()
 
             running_loss += loss.item() * self.accumulation_steps
+
+        # [BUG-4] flush leftover accumulated gradients from a partial final batch
+        remainder = len(loader) % self.accumulation_steps
+        if remainder != 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad()
 
         return running_loss / len(loader)
 
@@ -176,11 +217,11 @@ class BaseTrainer:
         Train for up to `epochs` epochs with early stopping.
 
         Returns:
-            (best_model, best_accuracy)   — best model by validation accuracy.
+            (best_model, best_accuracy) — best model by validation accuracy.
         """
         best_acc    = 0.0
         best_state  = deepcopy(self.model.state_dict())
-        no_improve  = 0   # correctly incremented early-stopping counter
+        no_improve  = 0
 
         for epoch in range(1, epochs + 1):
             train_loss = self._train_epoch(train_loader)
@@ -192,7 +233,7 @@ class BaseTrainer:
                 best_state = deepcopy(self.model.state_dict())
                 no_improve = 0
             else:
-                no_improve += 1   # ← fixed: was += 0 in original code
+                no_improve += 1   # [BUG-1] was += 0 in original
 
             if epoch % 10 == 0 or epoch == epochs:
                 logger.info(
@@ -206,7 +247,6 @@ class BaseTrainer:
                             f"(no improvement for {self.patience} epochs)")
                 break
 
-        # Restore best weights before returning
         self.model.load_state_dict(best_state)
         logger.info(f"[BaseTrainer] Done — best val accuracy: {best_acc:.4f}%")
         return self.model, best_acc
@@ -220,7 +260,7 @@ class KDTrainer:
     """
     Knowledge-distillation fine-tuner.
 
-    Teacher is frozen.  Student is trained with a combination of KD loss
+    Teacher is frozen. Student is trained with a combination of KD loss
     (soft targets from teacher) and standard cross-entropy on hard labels.
 
     Loss (per batch):
@@ -230,18 +270,6 @@ class KDTrainer:
     Dynamic alpha: if `dynamic_alpha=True`, α decays linearly from α_start
     to 0.1 over the training budget so the student transitions from soft- to
     hard-label supervision.
-
-    Args:
-        teacher_model:   Frozen reference model.
-        student_model:   Model being fine-tuned (modified in-place).
-        device:          Compute device.
-        lr:              Adam learning rate.
-        weight_decay:    L2 regularisation.
-        alpha:           Initial KD loss weight (0 = CE only, 1 = KD only).
-        temperature:     Softmax temperature T for soft targets.
-        patience:        Early stopping patience.
-        dynamic_alpha:   Linearly anneal α to 0.1.
-        use_amp:         Enable AMP.
     """
 
     def __init__(
@@ -264,9 +292,9 @@ class KDTrainer:
         self.temperature   = temperature
         self.patience      = patience
         self.dynamic_alpha = dynamic_alpha
+        # [BUG-3] new AMP API
         self.use_amp       = use_amp and device.type == "cuda"
 
-        # Freeze teacher
         for p in self.teacher.parameters():
             p.requires_grad_(False)
 
@@ -277,13 +305,12 @@ class KDTrainer:
         self.scheduler    = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer, T_0=50, T_mult=2, eta_min=1e-6,
         )
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        # [BUG-3] new GradScaler
+        self.scaler = _make_scaler(self.use_amp)
 
     def _alpha(self, epoch: int, total_epochs: int) -> float:
-        """Return current alpha value (constant or linearly decayed)."""
         if not self.dynamic_alpha:
             return self.alpha_start
-        # Linear decay: alpha_start → 0.1 over total_epochs
         alpha_end = 0.1
         progress  = (epoch - 1) / max(total_epochs - 1, 1)
         return self.alpha_start + progress * (alpha_end - self.alpha_start)
@@ -301,19 +328,22 @@ class KDTrainer:
         self.teacher.eval()
         alpha        = self._alpha(epoch, total_epochs)
         running_loss = 0.0
+        device_type  = self.device.type
 
         for images, labels in loader:
             images = images.to(self.device, non_blocking=True)
             labels = labels.to(self.device, non_blocking=True)
 
-            with torch.cuda.amp.autocast(enabled=self.use_amp):
-                with torch.no_grad():
-                    t_logits = self.teacher(images)
-                s_logits = self.student(images)
+            # [BUG-5] get teacher logits in full precision OUTSIDE autocast,
+            # then cast to fp32 to avoid stale NaN with AMP
+            with torch.no_grad():
+                t_logits = self.teacher(images).float()
 
-                kd_loss = self._kd_loss(s_logits, t_logits)
-                ce_loss = self.ce_criterion(s_logits, labels)
-                loss    = alpha * kd_loss + (1.0 - alpha) * ce_loss
+            with _autocast(device_type, self.use_amp):
+                s_logits = self.student(images)
+                kd_loss  = self._kd_loss(s_logits.float(), t_logits)
+                ce_loss  = self.ce_criterion(s_logits, labels)
+                loss     = alpha * kd_loss + (1.0 - alpha) * ce_loss
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
@@ -345,11 +375,11 @@ class KDTrainer:
         KD fine-tune for up to `epochs` epochs with early stopping.
 
         Returns:
-            best_accuracy (float)  — best student val accuracy.
+            best_accuracy (float) — best student val accuracy.
         """
         best_acc   = 0.0
         best_state = deepcopy(self.student.state_dict())
-        no_improve = 0   # correctly incremented early-stopping counter
+        no_improve = 0
 
         for epoch in range(1, epochs + 1):
             train_loss = self._train_epoch(train_loader, epoch, epochs)
@@ -361,7 +391,7 @@ class KDTrainer:
                 best_state = deepcopy(self.student.state_dict())
                 no_improve = 0
             else:
-                no_improve += 1   # ← fixed: was += 0 in original code
+                no_improve += 1   # [BUG-2] was += 0 in original
 
             if epoch % 50 == 0 or epoch == epochs:
                 alpha = self._alpha(epoch, epochs)
